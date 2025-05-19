@@ -13,9 +13,9 @@ class ReportErrors extends Command
 
     public function handle()
     {
-        $this->info("🔍 Fehleranalyse…");
+        $this->info("Fehleranalyse…");
 
-        $this->info("📈 Top 10 Fehlercodes:");
+        $this->info("Top 10 Fehlercodes:");
         $topCodes = ExtractedEntry::select('code', DB::raw('COUNT(*) as anzahl'))
             ->whereNotNull('code')
             ->groupBy('code')
@@ -24,7 +24,7 @@ class ReportErrors extends Command
             ->get();
         $this->table(['Fehlercode', 'Anzahl'], $topCodes);
 
-        $this->info("📂 Fehler nach Kategorie:");
+        $this->info("Fehler nach Kategorie:");
         $byCategory = ExtractedEntry::select('category', DB::raw('COUNT(*) as anzahl'))
             ->groupBy('category')
             ->orderByDesc('anzahl')

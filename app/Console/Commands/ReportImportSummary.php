@@ -14,7 +14,7 @@ class ReportImportSummary extends Command
 
     public function handle()
     {
-        $this->info('📦 Import-Analyse gestartet…');
+        $this->info('Import-Analyse gestartet…');
 
         $byExtension = CaseFile::selectRaw('extension, count(*) as anzahl')
             ->groupBy('extension')
@@ -36,9 +36,9 @@ class ReportImportSummary extends Command
             $topExtensions->map(fn ($e) => [$e->extension, $e->dateien, $e->gesamt_kb])
         );
 
-        $this->info("📄 Gesamtdateien: " . CaseFile::count());
-        $this->info("✅ Geparste Dateien: " . ($byParsed->where('parsed', true)->first()?->anzahl ?? 0));
-        $this->info("📉 Fehler-Einträge insgesamt: $entryCount");
+        $this->info("Gesamtdateien: " . CaseFile::count());
+        $this->info("Geparste Dateien: " . ($byParsed->where('parsed', true)->first()?->anzahl ?? 0));
+        $this->info("Fehler-Einträge insgesamt: $entryCount");
 
         return Command::SUCCESS;
     }
