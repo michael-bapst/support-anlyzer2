@@ -15,6 +15,8 @@ return new class extends Migration {
             $table->longText('content');
             $table->timestamp('timestamp')->nullable();
             $table->json('metadata')->nullable();
+            $table->enum('severity', ['LOW', 'MEDIUM', 'HIGH'])->nullable();
+            $table->foreignId('pattern_id')->nullable()->constrained('error_patterns')->nullOnDelete();
             $table->timestamps();
         });
     }

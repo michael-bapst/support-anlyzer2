@@ -9,12 +9,10 @@ use App\Models\SupportCase as CaseModel;
 use Illuminate\Support\Str;
 use RecursiveIteratorIterator;
 use RecursiveDirectoryIterator;
-use SimpleXMLElement;
-
 class ImportCasesFromRoot extends Command
 {
     protected $signature = 'import:cases-from-root {rootPath}';
-    protected $description = 'Importiert sysinfo-Cases rekursiv mit Wiederaufnahme & Batchverarbeitung';
+    protected $description = 'Importiert sysinfo-Cases rekursiv mit Wiederaufnahme, Hash-Prüfung und Delta-Import';
 
     private array $keywords = [
         'ERROR', 'FAIL', 'EXCEPTION', 'ACCESS DENIED', 'CANNOT LOAD',
@@ -25,6 +23,7 @@ class ImportCasesFromRoot extends Command
 
     public function handle()
     {
+        $startTime = microtime(true);
         $rootPath = $this->argument('rootPath');
 
         if (!is_dir($rootPath)) {
@@ -44,6 +43,11 @@ class ImportCasesFromRoot extends Command
             $this->importCase($dir);
         }
 
+        $duration = microtime(true) - $startTime;
+        $this->info("⏱️ Dauer: " . round($duration, 2) . " Sekunden");
+
+        $this->logDbStats();
+
         $this->info("✅ Import abgeschlossen.");
         return Command::SUCCESS;
     }
@@ -51,15 +55,9 @@ class ImportCasesFromRoot extends Command
     private function importCase(string $dir)
     {
         $caseName = basename($dir);
-        $existing = CaseModel::where('name', $caseName)->first();
-
-        if ($existing) {
-            $this->line("⏭️  Case \"$caseName\" existiert bereits – überspringe.");
-            return;
-        }
-
-        $case = CaseModel::create([
+        $case = CaseModel::firstOrCreate([
             'name' => $caseName,
+        ], [
             'source_path' => $dir,
             'description' => null,
             'tags' => [],
@@ -73,7 +71,7 @@ class ImportCasesFromRoot extends Command
             }
         }
 
-        $this->info("📁 Case \"$caseName\" fertig importiert.");
+        $this->info("📁 Case \"$caseName\" fertig verarbeitet.");
     }
 
     private function importFile(CaseModel $case, string $path)
@@ -85,8 +83,9 @@ class ImportCasesFromRoot extends Command
         $hash = md5_file($path);
 
         $caseFile = CaseFile::where('case_id', $case->id)->where('filename', $filename)->first();
-        if ($caseFile?->parsed) {
-            $this->line("⏭️  Datei $filename bereits geparst – überspringe.");
+
+        if ($caseFile && $caseFile->parsed && $caseFile->hash === $hash) {
+            $this->line("⏭️  Datei $filename unverändert – überspringe.");
             return;
         }
 
@@ -102,6 +101,9 @@ class ImportCasesFromRoot extends Command
             'hash' => $hash,
             'parsed' => false,
         ]);
+
+        // Alte Einträge löschen
+        ExtractedEntry::where('case_file_id', $caseFile->id)->delete();
 
         if (in_array($extension, ['log', 'txt'])) {
             $this->parsePlainText($caseFile, $path);
@@ -257,5 +259,17 @@ class ImportCasesFromRoot extends Command
         if (Str::contains($file->path, 'network')) return 'Netzwerk';
 
         return 'Unbekannt';
+    }
+
+    private function logDbStats(): void
+    {
+        $caseCount = CaseModel::count();
+        $fileCount = CaseFile::count();
+        $entryCount = ExtractedEntry::count();
+
+        $this->info("📊 DB-Status:");
+        $this->line("  🔹 Cases: $caseCount");
+        $this->line("  🔹 Dateien: $fileCount");
+        $this->line("  🔹 Fehlerzeilen: $entryCount");
     }
 }

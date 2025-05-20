@@ -14,6 +14,8 @@ class ExtractedEntry extends Model
         'content',
         'timestamp',
         'metadata',
+        'severity',
+        'pattern_id',
     ];
 
     protected $casts = [
@@ -24,5 +26,10 @@ class ExtractedEntry extends Model
     public function file()
     {
         return $this->belongsTo(CaseFile::class, 'case_file_id');
+    }
+
+    public function pattern()
+    {
+        return $this->belongsTo(ErrorPattern::class, 'pattern_id');
     }
 }
