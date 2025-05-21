@@ -5,14 +5,16 @@ namespace App\Console\Commands;
 use Illuminate\Console\Command;
 use App\Models\CaseFile;
 use App\Models\ExtractedEntry;
+use App\Models\ErrorPattern;
 use App\Models\SupportCase as CaseModel;
 use Illuminate\Support\Str;
-use RecursiveIteratorIterator;
-use RecursiveDirectoryIterator;
+use Symfony\Component\Finder\Finder;
+use Illuminate\Support\Facades\Log;
+
 class ImportCasesFromRoot extends Command
 {
-    protected $signature = 'import:cases-from-root {rootPath}';
-    protected $description = 'Importiert sysinfo-Cases rekursiv mit Wiederaufnahme, Hash-Prüfung und Delta-Import';
+    protected $signature = 'import:cases-from-root {rootPath} {--dry-run}';
+    protected $description = 'Importiert Cases mit Log-Analyse, Fehler-Matching, Finder und optionalem DryRun';
 
     private array $keywords = [
         'ERROR', 'FAIL', 'EXCEPTION', 'ACCESS DENIED', 'CANNOT LOAD',
@@ -20,6 +22,7 @@ class ImportCasesFromRoot extends Command
     ];
 
     private int $batchSize = 500;
+    private $patterns;
 
     public function handle()
     {
@@ -27,34 +30,37 @@ class ImportCasesFromRoot extends Command
         $rootPath = $this->argument('rootPath');
 
         if (!is_dir($rootPath)) {
-            $this->error("❌ Pfad nicht gefunden: $rootPath");
+            $this->log("❌ Pfad nicht gefunden: $rootPath");
             return Command::FAILURE;
         }
 
+        $this->patterns = ErrorPattern::all();
         $dirs = array_filter(glob($rootPath . '/*'), 'is_dir');
 
         if (empty($dirs)) {
-            $this->warn("Keine Unterordner gefunden unter: $rootPath");
+            $this->log("Keine Unterordner gefunden unter: $rootPath");
             return Command::SUCCESS;
         }
 
-        $this->info("🚀 Starte Import aus: $rootPath");
+        $this->log("🚀 Starte Import aus: $rootPath");
         foreach ($dirs as $dir) {
             $this->importCase($dir);
         }
 
         $duration = microtime(true) - $startTime;
-        $this->info("⏱️ Dauer: " . round($duration, 2) . " Sekunden");
+        $this->log("⏱️ Dauer: " . round($duration, 2) . " Sekunden");
 
         $this->logDbStats();
 
-        $this->info("✅ Import abgeschlossen.");
+        $this->log("✅ Import abgeschlossen.");
         return Command::SUCCESS;
     }
 
     private function importCase(string $dir)
     {
         $caseName = basename($dir);
+        $this->log("📁 Starte Verarbeitung von Case: \"$caseName\"");
+
         $case = CaseModel::firstOrCreate([
             'name' => $caseName,
         ], [
@@ -63,15 +69,14 @@ class ImportCasesFromRoot extends Command
             'tags' => [],
         ]);
 
-        $files = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir));
+        $finder = new Finder();
+        $finder->files()->in($dir)->ignoreUnreadableDirs()->followLinks();
 
-        foreach ($files as $file) {
-            if ($file->isFile()) {
-                $this->importFile($case, $file->getPathname());
-            }
+        foreach ($finder as $file) {
+            $this->importFile($case, $file->getRealPath());
         }
 
-        $this->info("📁 Case \"$caseName\" fertig verarbeitet.");
+        $this->log("📁 Case \"$caseName\" fertig verarbeitet.");
     }
 
     private function importFile(CaseModel $case, string $path)
@@ -85,11 +90,11 @@ class ImportCasesFromRoot extends Command
         $caseFile = CaseFile::where('case_id', $case->id)->where('filename', $filename)->first();
 
         if ($caseFile && $caseFile->parsed && $caseFile->hash === $hash) {
-            $this->line("⏭️  Datei $filename unverändert – überspringe.");
+            $this->log("⏭️  Datei $filename unverändert – überspringe.");
             return;
         }
 
-        $this->line("📄 Datei: $relativePath ($sizeKb KB)");
+        $this->log("📄 Datei: $relativePath ($sizeKb KB)");
 
         $caseFile = CaseFile::updateOrCreate([
             'case_id' => $case->id,
@@ -102,8 +107,9 @@ class ImportCasesFromRoot extends Command
             'parsed' => false,
         ]);
 
-        // Alte Einträge löschen
-        ExtractedEntry::where('case_file_id', $caseFile->id)->delete();
+        if (!$this->option('dry-run')) {
+            ExtractedEntry::where('case_file_id', $caseFile->id)->delete();
+        }
 
         if (in_array($extension, ['log', 'txt'])) {
             $this->parsePlainText($caseFile, $path);
@@ -121,7 +127,7 @@ class ImportCasesFromRoot extends Command
         $count = 0;
 
         if (!$handle) {
-            $this->warn("⚠️  Datei konnte nicht geöffnet werden: $path");
+            $this->log("⚠️  Datei konnte nicht geöffnet werden: $path");
             return;
         }
 
@@ -130,20 +136,27 @@ class ImportCasesFromRoot extends Command
 
             foreach ($this->keywords as $keyword) {
                 if (stripos($line, $keyword) !== false) {
+                    $pattern = $this->matchErrorPattern($line);
+
                     $batch[] = [
                         'case_file_id' => $caseFile->id,
                         'entry_type' => $this->detectType($line),
-                        'code' => $this->extractCode($line),
-                        'category' => $this->guessCategory($caseFile),
+                        'code' => $pattern?->code ?? $this->extractCode($line),
+                        'category' => $pattern?->category ?? $this->guessCategory($caseFile),
                         'content' => trim($line),
                         'timestamp' => $this->extractTimestamp($line),
                         'metadata' => null,
+                        'severity' => $pattern?->severity,
+                        'pattern_id' => $pattern?->id,
                         'created_at' => now(),
                         'updated_at' => now(),
                     ];
+
                     $count++;
                     if (count($batch) >= $this->batchSize) {
-                        ExtractedEntry::insert($batch);
+                        if (!$this->option('dry-run')) {
+                            ExtractedEntry::insert($batch);
+                        }
                         $batch = [];
                     }
                     break;
@@ -152,29 +165,30 @@ class ImportCasesFromRoot extends Command
         }
 
         fclose($handle);
-
-        if (!empty($batch)) {
+        if (!empty($batch) && !$this->option('dry-run')) {
             ExtractedEntry::insert($batch);
         }
 
-        $caseFile->parsed = true;
-        $caseFile->save();
+        if (!$this->option('dry-run')) {
+            $caseFile->parsed = true;
+            $caseFile->save();
+        }
 
-        $this->line("    ✅ $count relevante Zeilen extrahiert.");
+        $this->log("    ✅ $count relevante Zeilen extrahiert.");
     }
 
     private function parseXml(CaseFile $caseFile, string $path)
     {
         $raw = @file_get_contents($path);
         if ($raw === false) {
-            $this->warn("⚠️  XML konnte nicht geladen werden: $path");
+            $this->log("⚠️  XML konnte nicht geladen werden: $path");
             return;
         }
 
         $raw = @mb_convert_encoding($raw, 'UTF-8', 'Windows-1252, ISO-8859-1, ASCII, UTF-8');
         $xml = @simplexml_load_string($raw);
         if ($xml === false) {
-            $this->warn("⚠️  XML konnte nicht geparst werden: $path");
+            $this->log("⚠️  XML konnte nicht geparst werden: $path");
             return;
         }
 
@@ -188,20 +202,27 @@ class ImportCasesFromRoot extends Command
                 $value = mb_convert_encoding($value, 'UTF-8', 'Windows-1252, ISO-8859-1, ASCII, UTF-8');
                 foreach ($this->keywords as $keyword) {
                     if (stripos($value, $keyword) !== false) {
+                        $pattern = $this->matchErrorPattern($value);
+
                         $batch[] = [
                             'case_file_id' => $caseFile->id,
                             'entry_type' => $this->detectType($value),
-                            'code' => $this->extractCode($value),
-                            'category' => $this->guessCategory($caseFile),
+                            'code' => $pattern?->code ?? $this->extractCode($value),
+                            'category' => $pattern?->category ?? $this->guessCategory($caseFile),
                             'content' => trim($value),
                             'timestamp' => $this->extractTimestamp($value),
                             'metadata' => null,
+                            'severity' => $pattern?->severity,
+                            'pattern_id' => $pattern?->id,
                             'created_at' => now(),
                             'updated_at' => now(),
                         ];
+
                         $count++;
                         if (count($batch) >= $this->batchSize) {
-                            ExtractedEntry::insert($batch);
+                            if (!$this->option('dry-run')) {
+                                ExtractedEntry::insert($batch);
+                            }
                             $batch = [];
                         }
                         break;
@@ -210,14 +231,26 @@ class ImportCasesFromRoot extends Command
             }
         }
 
-        if (!empty($batch)) {
+        if (!empty($batch) && !$this->option('dry-run')) {
             ExtractedEntry::insert($batch);
         }
 
-        $caseFile->parsed = true;
-        $caseFile->save();
+        if (!$this->option('dry-run')) {
+            $caseFile->parsed = true;
+            $caseFile->save();
+        }
 
-        $this->line("    ✅ $count XML-Zeilen extrahiert.");
+        $this->log("    ✅ $count XML-Zeilen extrahiert.");
+    }
+
+    private function matchErrorPattern(string $line): ?ErrorPattern
+    {
+        foreach ($this->patterns as $pattern) {
+            if ($pattern->keyword && stripos($line, $pattern->keyword) !== false) {
+                return $pattern;
+            }
+        }
+        return null;
     }
 
     private function extractCode(string $line): ?string
@@ -267,9 +300,15 @@ class ImportCasesFromRoot extends Command
         $fileCount = CaseFile::count();
         $entryCount = ExtractedEntry::count();
 
-        $this->info("📊 DB-Status:");
-        $this->line("  🔹 Cases: $caseCount");
-        $this->line("  🔹 Dateien: $fileCount");
-        $this->line("  🔹 Fehlerzeilen: $entryCount");
+        $this->log("📊 DB-Status:");
+        $this->log("  🔹 Cases: $caseCount");
+        $this->log("  🔹 Dateien: $fileCount");
+        $this->log("  🔹 Fehlerzeilen: $entryCount");
+    }
+
+    private function log(string $message): void
+    {
+        $this->line($message);
+        Log::channel('daily')->info('[Import] ' . $message);
     }
 }
